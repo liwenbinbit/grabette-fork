@@ -65,6 +65,40 @@ class Backend(ABC):
         itself. Default: no backend-detectable fault."""
         return ""
 
+    @property
+    def angle_sensors_status(self) -> dict:
+        """The gripper angle sensors, for the dashboard's "Angle sensors" chip.
+
+        enabled: this device is meant to have them; initialized: they came up;
+        error: the fault blocking capture because of them ("" = none).
+        Default: a backend without angle sensors."""
+        return {"enabled": False, "initialized": False, "error": ""}
+
+    def reinit_angle_sensors(self) -> None:
+        """Bring the angle sensors up again, now — the dashboard's way out of a
+        fault once its cause is fixed, without waiting for the next press.
+        Default: nothing to bring up."""
+        return None
+
+    # --- gripper angle calibration -------------------------------------------
+    # The angle sensors read the raw magnet angle; the zero (fingers fully
+    # open) is per device and has to be taken once on the device itself. Until
+    # it is, every gripper angle recorded is meaningless, so a backend that
+    # needs one reports it as a hardware_error too — needs_calibration is what
+    # lets the dashboard offer the fix rather than only show the refusal.
+
+    @property
+    def needs_calibration(self) -> bool:
+        """True while the angle sensors have no saved zero. Default: nothing
+        to calibrate."""
+        return False
+
+    async def calibrate_angles(self) -> dict:
+        """Take the current gripper pose (fully open) as the angle sensors'
+        zero, save it and apply it. Returns the saved calibration; raises
+        RuntimeError when it cannot be done right now."""
+        raise RuntimeError("This Grabette has no angle sensors to calibrate.")
+
     # --- busy gate -----------------------------------------------------------
     # A recording must not start on top of dataset work. On a Pi the upload is
     # not a sleeping socket: hf_xet chunks and hashes in native threads, so it
@@ -127,6 +161,12 @@ class Backend(ABC):
     @property
     @abstractmethod
     def is_capturing(self) -> bool: ...
+
+    @property
+    def is_finalizing(self) -> bool:
+        """True between a stop and the end of its deferred post-stop work (the
+        "saved" cue fires there). Default False for backends with none."""
+        return False
 
     @abstractmethod
     def get_frame_jpeg(self) -> bytes | None: ...

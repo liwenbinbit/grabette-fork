@@ -2,7 +2,7 @@
 <img src="docs/images/grabette_actions.gif" align="left" width="200px"/>
 <br>
 &nbsp;&nbsp;&nbsp;&nbsp;Autonomous Raspberry Pi service for robotic manipulation data collection:<br>
-&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;captures synchronized camera + depth + IMU streams from a handheld gripper<br>
+&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;captures synchronized camera + depth (+ IMU with the OAK-D SR) streams from a handheld gripper<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;manages recording sessions<br>
 &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&bull;&nbsp;uploads episodes to Hugging Face for cloud SLAM processing.
 
@@ -16,8 +16,8 @@
 |---|---|
 | **Board** | Raspberry Pi 4 |
 | **Primary camera** | RPi camera module, 1296x972 @ 46fps, fisheye lens (KannalaBrandt8) |
-| **OAK-D SR** | Stereo RGB-D camera with on-board BNO IMU (200Hz). Provides the depth + IMU stream for SLAM — **required** for trajectory recovery on Grabette. Replaces the legacy BMI088. Toggled on demand (default off to save battery; turn it on when recording for the pipeline). |
-| **Depth camera (alt.)** | Orbbec Gemini 305 — supported as a second source so the rig is not single-sourced. Passive stereo, no IMU; SLAM runs IMU-free. Opt in with `GRABETTE_DEPTH_CAMERA=gemini305` ([setup](#depth-camera-using-an-orbbec-gemini-305-make-install-orbbec-sdk)). |
+| **Depth camera** | Orbbec Gemini 305 — the default. Provides the depth stream SLAM needs, which is **required** for trajectory recovery on Grabette. Passive stereo, no IMU; SLAM runs IMU-free. Mounted inverted, and the frames are un-rotated at capture ([setup](#depth-camera-using-an-orbbec-gemini-305)). Toggled on demand (default off to save battery; a recording turns it on automatically). |
+| **Depth camera (alt.)** | Luxonis OAK-D SR — kept working as a second source so the rig is not single-sourced. Stereo RGB-D with an on-board BNO IMU (200Hz), which gravity-aligns the trajectory. Replaces the legacy BMI088. Select with `GRABETTE_DEPTH_CAMERA=oakd`, or `make install-rpi CAMERA=oakd`. |
 | **Angle sensors** | 2x AS5600L rotary encoders (proximal + distal finger joints), one per I2C bus (`/dev/i2c-3` distal, `/dev/i2c-4` proximal) |
 | **Button** | Grove LED Button (GPIO22 LED, GPIO23 button) — physical start/stop |
 | **Speaker** | TLV320AIC3104 codec on the V2 HAT (I2S audio, control on `i2c-1` @ `0x18`, 12 MHz MCLK) — cues the recording start, the stop, the episode being written, and failures |
@@ -32,16 +32,20 @@
 
 ### Development (mock mode, no hardware needed)
 
-> Part of the uv **workspace**: a bare `uv sync` here would build the *entire
-> monorepo* environment. Always pass `--package` (root README → Development).
+> Part of the uv **workspace**: a bare `uv sync` from the repo root builds the
+> *entire monorepo* environment. Always pass `--package` (root README → Development).
 
 ```bash
-uv sync --package grabette
+uv sync --package grabette --extra ui --extra hf   # ui: dashboard, hf: Hugging Face login
 uv run --package grabette python main.py
 # → http://localhost:8000
 ```
 
 ### Raspberry Pi
+
+**Recommended: flash the prebuilt image.** Download `image_<date>-grabetteos-<version>.zip` from the [latest grabette-os release](https://github.com/pollen-robotics/grabette-os/releases/latest) and flash it with the Raspberry Pi Imager ("Use custom"; no customisation is possible, none is needed). Then set the WiFi with the [Bluetooth tool](https://pollen-robotics.github.io/grabette/#wifi) and SSH in as `pollen` (password `root`); the hostname is `grabette-<serial digits>`. Everything below (deps, venv, overlays, speaker, NTP, udev rules, systemd services) is already baked in; the image is a right hand with the Gemini 305 by default (edit `/etc/grabette/env` otherwise). Only the [angle calibration](#calibration) is left to do. Details: [Build your own](../../docs/source/build_your_own.md#flash-the-raspberry-pi).
+
+The rest of this section is the **manual install** on a stock Raspberry Pi OS.
 
 Tested on **Raspberry Pi OS Bookworm (Debian 12)** and **Trixie (Debian 13)**. No specific Pi OS version is pinned — the Makefile target uses whatever system Python is at `/usr/bin/python3` (3.11 on Bookworm, 3.13 on Trixie).
 
@@ -68,6 +72,7 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 sudo cp config/config.txt /boot/firmware
 make install-audio                 # builds the speaker's devicetree overlay — before the reboot
 make install-netdev
+make install-i2c-fix               # lets the dashboard's angle-sensor "Diagnose" popup apply its fixes
 sudo reboot
 ```
 
@@ -84,33 +89,43 @@ sudo reboot
 #### One-shot bringup
 A grabette is built as either a **left** or **right** hand — the angle sensors are mounted mirrored, so the daemon needs to know which one this device is. Pick at install time:
 ```bash
-make install-rpi HAND=right    # or HAND=left
+make install-rpi HAND=right                  # or HAND=left
+make install-rpi HAND=right CAMERA=oakd      # on a grabette that carries an OAK-D SR
 uv run python -m grabette
 ```
 
 > `HAND` is required — running `make install-rpi` without it fails with a clear error. The choice is written to `/etc/grabette/env` as `GRABETTE_HAND=<value>` and persists across reboots (sourced by `grabette.service`).
 
+> `CAMERA` is optional and defaults to `gemini305`. It selects which depth camera this device is set up for: only that camera's udev rule is installed, the Orbbec SDK is installed only when it is needed, and the choice is written as `GRABETTE_DEPTH_CAMERA=<value>`. A fresh Pi has no config for `install-rpi` to read, so the target writes the setting rather than consulting it — **re-running `install-rpi` on an OAK-D grabette without `CAMERA=oakd` will switch it to the Gemini.**
+
 `make install-rpi HAND=...` does the following — automating the steps that are easy to get subtly wrong by hand:
 - `sudo apt install python3-libcamera python3-picamera2 libcap-dev ffmpeg python3-dbus python3-gi` (the dbus/gi packages are system deps for the BLE WiFi service).
-- Installs the OAK-D / Movidius USB udev rule (`/etc/udev/rules.d/80-movidius.rules`).
+- Installs the USB udev rule for `CAMERA` only — `/etc/udev/rules.d/99-obsensor-libusb.rules` for the Gemini 305, `/etc/udev/rules.d/80-movidius.rules` for the OAK-D.
 - Creates the venv with `uv venv --python /usr/bin/python3 --system-site-packages` — **both flags matter**:
   - `--python /usr/bin/python3` ensures uv uses the apt-managed Python (which owns `python3-libcamera`/`python3-picamera2`), not uv's own managed Python under `~/.local/share/uv/python/...`.
   - `--system-site-packages` makes the apt-installed `libcamera` and `numpy` visible to the venv.
 - Runs `uv sync --package grabette --extra rpi --extra ui --extra hf` and verifies all imports succeed.
-- Writes `/etc/grabette/env` with `GRABETTE_HAND=<value>` (preserving any prior `GRABETTE_*_SIGN` overrides).
+- Runs `install-orbbec-sdk` when `CAMERA=gemini305` (`pyorbbecsdk2` is not in the `rpi` extra — see below).
+- Writes `/etc/grabette/env` with `GRABETTE_HAND=<value>` and `GRABETTE_DEPTH_CAMERA=<value>` (preserving any prior `GRABETTE_*_SIGN` overrides).
 - Runs `install-ntp` (below) so the device's clock is disciplined against a shared time service.
 - Runs `install-audio` (below) so the HAT speaker's overlay + mixer init are in place.
 
 Note: `install-rpi` does **not** install or start the systemd services — that's `make install-systemd` (next section).
 
-### Depth camera: using an Orbbec Gemini 305 (`make install-orbbec-sdk`)
+### Depth camera: using an Orbbec Gemini 305
 
-The depth camera is pluggable. `oakd` (Luxonis OAK-D SR) is the default and needs
-no configuration; `gemini305` (Orbbec Gemini 305) is a second option so the rig
-is not single-sourced on one vendor. `make install-rpi` already installs the
-Orbbec udev rule, but the SDK and the setting are opt-in:
+The depth camera is pluggable: `gemini305` (Orbbec Gemini 305) and `oakd`
+(Luxonis OAK-D SR), so the rig is not single-sourced on one vendor.
+
+**On a fresh install there is nothing to do here.** `make install-rpi` defaults
+to `CAMERA=gemini305` and installs the udev rule, the SDK and the setting itself.
+
+The commands below are only for moving an **already-installed** device onto the
+Gemini, where re-running the full bringup — which wipes and rebuilds the venv —
+would be overkill:
 
 ```bash
+make install-udev-orbbec                                           # udev rule
 make install-orbbec-sdk                                            # pyorbbecsdk2
 sudo sh -c 'echo GRABETTE_DEPTH_CAMERA=gemini305 >> /etc/grabette/env'
 sudo systemctl restart grabette
@@ -130,12 +145,18 @@ requirements (`opencv-python`, `numpy>=2.1.0`) exist for the SDK's bundled
 examples and would shadow the system numpy that picamera2 links against. See the
 comment on the target in the Makefile.
 
-Two behavioural differences worth knowing before recording:
+Three behavioural differences worth knowing before recording:
 
 - **No IMU.** The 305 has none, so no `dcam_imu.json` is written and SLAM runs
   IMU-free. This is measured, not assumed: removing the IMU perturbs odometry no
   more than re-running the identical pipeline does. `metadata.json` records
   `"imu": null`, which means "known absent" rather than "not read".
+- **Mounted upside down.** The 305 sits inverted on the grip, so every frame is
+  rotated 180 deg at capture and the principal point is flipped with it — an
+  episode is therefore indistinguishable from an upright one, and
+  `metadata.json` records `"image_orientation": "rotate_180_in_capture"`. Set
+  `GRABETTE_ORBBEC_ROTATE_180=false` for a rig that carries it upright. The
+  URDF describes the corrected frame, so it must NOT also gain a 180 deg roll.
 - **Passive stereo, IR-cut, no projector.** It needs a lit, textured workspace
   and degrades first when either runs short. `GRABETTE_ORBBEC_IR_EXPOSURE_US`
   (with `GRABETTE_ORBBEC_IR_GAIN`) pins a shorter IR exposure to reduce motion
@@ -229,8 +250,8 @@ is Pi-4-specific lives in `config/config.txt` and in how the card is addressed:
 
 `make install-audio` (idempotent) does:
 - `apt install device-tree-compiler alsa-utils`;
-- adds `rasp` to the `audio` group (`/dev/snd/*` is `root:audio 0660`, and the
-  daemon runs as `rasp`);
+- adds the service user (the checkout owner, `SERVICE_USER=` to override) to the
+  `audio` group (`/dev/snd/*` is `root:audio 0660`, and the daemon runs as that user);
 - compiles `config/overlays/tlv320aic3104-overlay.dts` → `/boot/firmware/overlays/tlv320aic3104.dtbo`;
 - **checks** (never writes) `/boot/firmware/config.txt` for `dtoverlay=tlv320aic3104`
   and `dtparam=i2s=on`, and tells you exactly which lines are missing — an
@@ -304,7 +325,9 @@ To put the device on WiFi without a screen or SSH, use the BLE setup service —
 
 ## Calibration
 
-Before using Grabette, calibrate the angle sensors. For that, open completely the gripper (Both joints must be fully extended when opening), then run the calibration script:
+Before using Grabette, calibrate the angle sensors. Until it is done the grabette refuses to record (error LED), and the dashboard shows **Your device is not calibrated** with a **Calibrate my device** button, on the Overview and on Test Recording. Click it, open the gripper completely (both joints fully extended, against their stop) and click **Start calibration**. It applies at once, no reboot needed.
+
+Over SSH, the script does the same thing (but needs a restart):
 ```bash
 python3 scripts/calibrate_angles.py
 sudo reboot
@@ -312,32 +335,22 @@ sudo reboot
 
 ## Usage
 
-Once running (mock or on-device), open the dashboard at `http://<device>.local:8000`: 
-<img align= "center" src="docs/images/grabette-dashboard.png"  width="80%" /><br>
+Recordings are started and stopped with the **physical button** on the device. Once running (mock or on-device), open the dashboard at `http://<device>.local:8000`:
+<!-- TODO(after 170/171 merge): add a screenshot of the Overview page. -->
 
+**Overview**: live cameras (RGB / depth), 3D model, device info and health, Hugging Face sign-in, and the link to the Fleet Space.
 
-From the different sections, you can:
+**Test Recording**: a guided first recording — record, replay, delete.
 
-**Episodes**:
-1. Start/stop a recording (you can either use the button on the device)
-2. Create tasks
-3. Start/stop a session of recordings for one same task
-4. Replay and manage captured episodes.
+**Episodes**: replay, check, download and delete captured episodes, by task.
 
-**Datasets**:
-- Trigger postprocessing with SLAM and upload episodes to a Hugging Face dataset repo (LeRobot format).
+**Network**: device info and WiFi connection.
 
-**Live View**: 
-- Preview the cameras and live sensor charts.
-
-**Settings**:
-1. Find IP address and device info
-2. Manage the Wifi connexion
-3. Log in to Hugging Face 
+Tasks, recording sessions, uploads and dataset creation (SLAM → LeRobot) are done from the [Fleet Space](https://huggingface.co/spaces/pollen-robotics/grabette-fleet). Every page has a **Power off** button.
 
 
 
-> Recordings are written to `~/grabette-data/` — see the [data format](docs/data_format.md).<br> Downstream SLAM → LeRobot dataset generation is handled by [grabette-postprocess](../grabette-postprocess).
+> Recordings are written to `~/grabette-data/` — see the [data format](docs/data_format.md).<br> Downstream SLAM → LeRobot dataset generation is handled by [grabette-postprocess](https://github.com/pollen-robotics/grabette-slam/tree/develop/grabette-postprocess).
 
 ## Documentation
 
@@ -351,4 +364,4 @@ From the different sections, you can:
 | Package | Description |
 |---|---|
 | [gripette](../gripette) | gRPC motor+camera service for the motorized gripper (Pi Zero 2W) |
-| [grabette-postprocess](../grabette-postprocess) | SLAM/VIO + LeRobot dataset generation (Docker) |
+| [grabette-postprocess](https://github.com/pollen-robotics/grabette-slam/tree/develop/grabette-postprocess) | SLAM/VIO + LeRobot dataset generation (Docker) |

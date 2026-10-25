@@ -1,6 +1,6 @@
 """Is a recorded episode complete enough to be convertible?
 
-The SLAM Space runs the authoritative check (grabette_postprocess
+The SLAM Space runs the authoritative check (grabette-slam's grabette_postprocess
 checks.recording): it decodes videos, counts samples and looks for stuck joints.
 This is the cheap local mirror of the same contract — presence and non-emptiness
 only, no decoding — so the device can answer the one question that matters
@@ -32,7 +32,7 @@ from grabette.hardware.episode_files import (DCAM_CALIB_OFFLINE, DCAM_DEPTH_DIR,
                                              resolve)
 
 # Files every episode must carry for the raw → LeRobot conversion to be possible.
-# Mirrors the required inputs of grabette_postprocess.checks.recording:
+# Mirrors the required inputs of grabette_postprocess.checks.recording (grabette-slam):
 #   SLAM     — dcam_left.mp4 + timestamps, depth + timestamps, imu, offline calib
 #   Dataset  — angle_data.json (gripper), raw_video.mp4 (Arducam)
 # Named canonically; episodes recorded before the dcam_ rename carry the oakd_*
@@ -51,6 +51,21 @@ REQUIRED_FILES = (
 # (stop_recording muxes the directory into the .mkv, so which one is present
 # depends on when the episode was recorded). Either satisfies the requirement.
 _DEPTH_ALTERNATIVES = (DCAM_DEPTH_VIDEO, DCAM_DEPTH_DIR)
+
+
+# Sidecars listing one entry per recorded frame. A depth camera that streamed
+# nothing still writes them, as {"samples": []}, next to a header-only video:
+# every file is there and non-empty, and not a single frame was recorded.
+_FRAME_SIDECARS = (DCAM_LEFT_TS, DCAM_DEPTH_TS)
+
+
+def _has_frames(path: Path) -> bool:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return False
+    samples = data.get("samples") if isinstance(data, dict) else data
+    return bool(samples)
 
 
 def _present(path: Path) -> bool:
@@ -98,7 +113,8 @@ def missing_files(episode_dir: Path) -> list[str]:
     required = [name for name in REQUIRED_FILES
                 if name != DCAM_IMU or _expects_imu(episode_dir)]
     missing = [name for name in required
-               if not _present(resolve(episode_dir, name))]
+               if not _present(path := resolve(episode_dir, name))
+               or (name in _FRAME_SIDECARS and not _has_frames(path))]
     if not any(_present(resolve(episode_dir, alt)) for alt in _DEPTH_ALTERNATIVES):
         missing.append(_DEPTH_ALTERNATIVES[0])
     return sorted(missing)

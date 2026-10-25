@@ -73,6 +73,7 @@ def _create_backend():
             depth_camera=settings.depth_camera,
             orbbec_ir_exposure_us=settings.orbbec_ir_exposure_us,
             orbbec_ir_gain=settings.orbbec_ir_gain,
+            orbbec_rotate_180=settings.orbbec_rotate_180,
         )
     else:  # auto
         try:
@@ -86,6 +87,7 @@ def _create_backend():
                 depth_camera=settings.depth_camera,
                 orbbec_ir_exposure_us=settings.orbbec_ir_exposure_us,
                 orbbec_ir_gain=settings.orbbec_ir_gain,
+                orbbec_rotate_180=settings.orbbec_rotate_180,
             )
         except ImportError:
             from grabette.backend.mock import MockBackend
@@ -108,6 +110,7 @@ _SPACE_WAKE_PROBE_TIMEOUT_S = 20.0  # one liveness probe
 _SPACE_WAKE_RETRY_S = 5.0           # between probes
 _SPACE_POST_TIMEOUT_S = 120.0       # /api/process, on a Space known to be awake
 _SPACE_POLL_TIMEOUT_S = 30.0        # one /api/status poll (retried on failure)
+_SPACE_STALL_TIMEOUT_S = 1800.0     # no change in the Space's status for this long = wedged
 
 # --- episode upload (raw dataset) ---------------------------------------------
 # Three layers, because each catches what the one below it cannot:
@@ -595,6 +598,41 @@ def _busy_reason() -> str:
     return _RECORDING_BLOCKERS.get(_device_activity(), "")
 
 
+# Longest a goal cue waits for the take it closes to be stopped and saved. A
+# group stop is scheduled a few seconds ahead and the save follows the mux, so
+# this is generous; past it something is wrong, and a late fanfare would only
+# confuse.
+GOAL_CUE_WAIT_S = 30.0
+# Pause after the "saved" blip so the two cues are heard apart — and so they
+# don't reach the card together (see _play_goal_when_saved).
+GOAL_CUE_GAP_S = 0.5
+_sound_tasks: set[asyncio.Task] = set()
+
+
+async def _play_goal_when_saved(backend) -> None:
+    """Play the goal cue once the take that reached the goal is stopped AND
+    saved. The fleet sends it on that take's stop, which this device then follows
+    with its own stop and saved cues, a second or more later: waiting them out
+    makes the goal the last thing heard, and keeps two aplay off the card at the
+    same time (the card is opened directly, without a mixer, so the second may
+    simply fail)."""
+    from grabette.hardware.sound import get_speaker
+
+    def busy() -> bool:
+        return (backend.is_capturing or getattr(backend, "is_stopping", False)
+                or backend.is_finalizing)
+
+    deadline = time.monotonic() + GOAL_CUE_WAIT_S
+    while busy():
+        if time.monotonic() > deadline:
+            logger.warning("Goal cue dropped: still recording or saving after %.0fs",
+                           GOAL_CUE_WAIT_S)
+            return
+        await asyncio.sleep(0.1)
+    await asyncio.sleep(GOAL_CUE_GAP_S)
+    get_speaker().play_goal()
+
+
 async def _dispatch_relay_command(cmd: dict) -> dict:
     """Map fleet commands to grabette daemon actions.
 
@@ -638,6 +676,29 @@ async def _dispatch_relay_command(cmd: dict) -> dict:
         return {"status": "error", "message": "daemon not running"}
     scheduler = get_capture_scheduler()
 
+    if ctype == "play_sound":
+        # The fleet's audio signal: the session's episode goal was just reached.
+        # Acked at once and played in the background — the relay runs commands
+        # one at a time, and waiting here for the save would hold up the next
+        # start_capture behind it.
+        cue = cmd.get("args", {}).get("cue")
+        if cue != "goal":
+            return {"status": "error", "message": f"unknown cue {cue!r}"}
+        task = asyncio.create_task(_play_goal_when_saved(daemon.backend))
+        _sound_tasks.add(task)  # strong ref: asyncio only keeps a weak one
+        task.add_done_callback(_sound_tasks.discard)
+        return {"status": "ok"}
+
+    if ctype == "test_sound":
+        # The fleet's ▶ buttons: the dashboard's sound test, refusals included.
+        from fastapi import HTTPException
+        from grabette.app.routers.sound import play_test
+        try:
+            play_test(cmd.get("args", {}).get("cue"))
+        except HTTPException as e:
+            return {"status": "error", "message": str(e.detail)}
+        return {"status": "ok"}
+
     if ctype == "get_state":
         status = daemon.status
         if scheduler.is_scheduled():
@@ -648,6 +709,17 @@ async def _dispatch_relay_command(cmd: dict) -> dict:
         from huggingface_hub import logout as hf_logout
         hf_logout()
         return {"status": "ok"}
+
+    if ctype == "shutdown":
+        # Same path as the dashboard's Power off button: refuses mid-recording,
+        # checks the sudoers grant, arms the UPS cut, then powers off after a
+        # short delay so this result still reaches the fleet.
+        from fastapi import HTTPException
+        from grabette.app.routers.system import system_shutdown
+        try:
+            return {"status": "ok", **(await system_shutdown())}
+        except HTTPException as e:
+            return {"status": "error", "message": str(e.detail)}
 
     if ctype == "upload_episodes":
         # Fleet-orchestrated dataset build: push THIS device's recorded streams
@@ -809,10 +881,14 @@ async def _dispatch_relay_command(cmd: dict) -> dict:
                     space_jid = (await r.json()).get("job_id")
                 if not space_jid:
                     return {"status": "error", "message": "Space returned no job_id"}
-                deadline = time.monotonic() + 3600.0  # 60-min cap
+                last_progress = time.monotonic()
+                last_mark = None
                 while True:
-                    if time.monotonic() > deadline:
-                        return {"status": "error", "message": "processing timed out"}
+                    stalled = time.monotonic() - last_progress
+                    if stalled >= _SPACE_STALL_TIMEOUT_S:
+                        return {"status": "error", "message": (
+                            f"processing stalled — no progress from the Space for "
+                            f"{stalled / 60:.0f} min (job {space_jid})")}
                     await asyncio.sleep(5.0)
                     # Stop waiting on the Space as soon as the build is cancelled.
                     # NB: this releases the device, it does not stop the Space —
@@ -829,6 +905,9 @@ async def _dispatch_relay_command(cmd: dict) -> dict:
                             st = await r.json()
                     except Exception:  # noqa: BLE001 — transient poll error, retry
                         continue
+                    mark = (len(str(st.get("log") or "")), len(st.get("quality") or []))
+                    if mark != last_mark:
+                        last_mark, last_progress = mark, time.monotonic()
                     sstatus = st.get("status", "running")
                     if sstatus == "done":
                         result_url = st.get("result")
@@ -1156,7 +1235,8 @@ async def lifespan(app: FastAPI):
             capabilities=["get_state", "start_capture", "stop_capture", "logout",
                           "upload_episodes", "process_dataset", "cancel_dataset",
                           "delete_episode", "edit_task", "delete_task",
-                          "assign_episodes", "prepare_capture"],
+                          "assign_episodes", "prepare_capture", "shutdown",
+                          "play_sound", "test_sound"],
             hand=settings.hand,
             battery_provider=_pisugar_battery,  # reported via heartbeat for the fleet UI
             tasks_provider=get_task_manager().report_tasks,  # this device's tasks, sent on connect
@@ -1170,6 +1250,7 @@ async def lifespan(app: FastAPI):
             # only find that out by walking up to the grabette and reading its
             # LED will find it out too late.
             fault_provider=lambda: getattr(_daemon.backend, "hardware_error", ""),
+            depth_warm_provider=lambda: getattr(_daemon.backend, "is_depth_camera_warm", None),
         )
         relay_task = asyncio.create_task(relay.run(_handle_relay_command))
         logger.info("Relay started → %s (device: %s)", settings.relay_url, settings.device_id)
@@ -1227,9 +1308,12 @@ def create_app() -> FastAPI:
             content={"detail": "Internal server error"},
         )
 
+    from grabette.app.routers.angle import router as angle_router
+    from grabette.app.routers.calibration import router as calibration_router
     from grabette.app.routers.charts import router as charts_router
     from grabette.app.routers.oakd import router as oakd_router
     from grabette.app.routers.replay import router as replay_router
+    from grabette.app.routers.sound import router as sound_router
     from grabette.app.routers.viewer import router as viewer_router
     from grabette.app.routers.wifi import router as wifi_router
     from grabette.app.routers.teleop import router as teleop_router
@@ -1241,17 +1325,31 @@ def create_app() -> FastAPI:
     app.include_router(camera_router)
     app.include_router(hf_router)
     app.include_router(system_router)
+    app.include_router(sound_router)
     app.include_router(viewer_router)
     app.include_router(charts_router)
     app.include_router(replay_router)
     app.include_router(teleop_router)
     app.include_router(oakd_router)
+    app.include_router(angle_router)
+    app.include_router(calibration_router)
 
     # Serve URDF model + STL meshes as static files
     _urdf_dir = Path(__file__).resolve().parent.parent.parent / "urdf"
     if _urdf_dir.is_dir():
         app.mount("/urdf", StaticFiles(directory=str(_urdf_dir)), name="urdf")
         logger.info("URDF assets mounted at /urdf from %s", _urdf_dir)
+
+    # Images the dashboard pages reference directly (step illustrations). Must
+    # be mounted before Gradio takes "/", like every other route here.
+    #
+    # NOT at /assets: Gradio's page shell references its own frontend bundle as
+    # ./assets/index-*.js, so mounting there shadows it — the dashboard's
+    # JavaScript 404s and every page hangs on a loading spinner forever.
+    _assets_dir = Path(__file__).resolve().parent.parent / "ui" / "assets"
+    if _assets_dir.is_dir():
+        app.mount("/ui-assets", StaticFiles(directory=str(_assets_dir)), name="ui-assets")
+        logger.info("UI assets mounted at /ui-assets from %s", _assets_dir)
 
     # Auth router (OAuth PKCE + manual token) — must be registered before Gradio
     from grabette.auth import get_hf_auth
@@ -1263,19 +1361,17 @@ def create_app() -> FastAPI:
     if settings.ui_enabled:
         try:
             import gradio as gr
-            from grabette.ui.app import create_ui
+            from grabette.ui.app import MODAL_CSS, NAV_HEAD, create_ui
 
             demo = create_ui()
-            # `allowed_paths` whitelists directories from which Gradio's
-            # `/gradio_api/file=<path>` handler will serve files to the
-            # browser. Without this, the multi-GB episode archives written
-            # to data_dir/.downloads/ pass silently through — the file
-            # exists on disk but Gradio refuses to hand it out, and the UI
-            # never surfaces a download link. Default allowed paths cover
-            # only Gradio's own cache and the OS temp dir.
+            # `css=` is not optional here: mount_gradio_app overwrites
+            # blocks.css with its own argument, so the stylesheet passed to
+            # gr.Blocks(css=...) is silently dropped when the UI is mounted
+            # rather than launched (gradio 6.17, routes.py: blocks.css = css
+            # or ""). Every custom rule — the Test Recording layout, the
+            # auth modal — disappears without this.
             app = gr.mount_gradio_app(
-                app, demo, path="/",
-                allowed_paths=[str(settings.data_dir / ".downloads")],
+                app, demo, path="/", css=MODAL_CSS, head=NAV_HEAD, footer_links=[],
             )
             logger.info("Gradio UI mounted at /")
         except ImportError:

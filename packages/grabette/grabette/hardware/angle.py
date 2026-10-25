@@ -17,6 +17,7 @@ import math
 import threading
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 from ..config import settings
@@ -25,6 +26,52 @@ from .sync import SyncManager
 logger = logging.getLogger(__name__)
 
 CALIBRATION_FILE = Path.home() / ".grabette" / "angle_calibration.json"
+# Reads averaged per sensor when calibrating, for a stable zero.
+CALIBRATION_SAMPLES = 20
+
+
+def load_calibration() -> dict | None:
+    """The saved offsets, or None when this device was never calibrated.
+
+    A file that cannot be read or lacks an offset counts as missing: zero
+    offsets are not a calibration, they are raw magnet angles, and an episode
+    recorded with them has a gripper channel that means nothing."""
+    try:
+        with open(CALIBRATION_FILE) as f:
+            data = json.load(f)
+        for key in ("sensor_1_offset_deg", "sensor_2_offset_deg"):
+            float(data[key])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    return data
+
+
+def save_calibration(offset_1_deg: float, offset_2_deg: float) -> dict:
+    """Write the offsets read at the fully-open pose; returns what was saved."""
+    calibration = {
+        "sensor_1_offset_deg": round(offset_1_deg, 6),
+        "sensor_2_offset_deg": round(offset_2_deg, 6),
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    CALIBRATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CALIBRATION_FILE.with_suffix(".tmp")
+    with open(tmp, "w") as f:
+        json.dump(calibration, f, indent=2)
+    tmp.replace(CALIBRATION_FILE)
+    return calibration
+
+
+def read_raw_averaged(read_deg, n: int = CALIBRATION_SAMPLES) -> float:
+    """Average N reads of `read_deg()` (degrees), as a circular mean so a
+    magnet sitting on the 360/0 wrap does not average to 180."""
+    sin_sum = 0.0
+    cos_sum = 0.0
+    for _ in range(n):
+        rad = math.radians(read_deg())
+        sin_sum += math.sin(rad)
+        cos_sum += math.cos(rad)
+        time.sleep(0.01)
+    return math.degrees(math.atan2(sin_sum / n, cos_sum / n)) % 360.0
 
 
 @dataclass
@@ -49,6 +96,10 @@ class AngleCapture:
     DEFAULT_SAMPLE_RATE_HZ = 100
     AS5600_ADDRESS = 0x40  # AS5600L default; AS5600 (non-L) was 0x36
     ANGLE_REGISTER = 0x0C
+    # A sensor with no successful read for this long is reported unplugged.
+    # Several 50 Hz idle reads (or 100 Hz capture reads): one glitch is not a
+    # disconnection, a second of silence is.
+    STALE_S = 1.0
     # Per-sensor signs are read from settings.distal_sign / proximal_sign,
     # derived from settings.hand. See gripette/grabette/config.py for the
     # right/left → sign mapping.
@@ -73,17 +124,33 @@ class AngleCapture:
 
         self._offset_1_deg = 0.0
         self._offset_2_deg = 0.0
+        # time.monotonic() of the last successful read, distal then proximal —
+        # the only proof a sensor is there: opening its bus succeeds without one.
+        self._last_ok = [0.0, 0.0]
         self._load_calibration()
 
     def _load_calibration(self) -> None:
-        if CALIBRATION_FILE.exists():
-            try:
-                with open(CALIBRATION_FILE) as f:
-                    data = json.load(f)
-                self._offset_1_deg = data.get("sensor_1_offset_deg", 0.0)
-                self._offset_2_deg = data.get("sensor_2_offset_deg", 0.0)
-            except Exception:
-                pass
+        data = load_calibration()
+        if data is not None:
+            self._offset_1_deg = float(data["sensor_1_offset_deg"])
+            self._offset_2_deg = float(data["sensor_2_offset_deg"])
+
+    def calibrate(self) -> dict:
+        """Take the current pose as zero (fingers fully open), save it and
+        apply it at once — no restart needed. Blocking (~0.4 s of I2C reads):
+        call it from an executor. Not while capturing."""
+        if self._running:
+            raise RuntimeError("Angle capture is running")
+        if self._i2c_1 is None or self._i2c_2 is None:
+            raise RuntimeError("Sensors not initialized. Call init_sensors() first.")
+        raw1 = read_raw_averaged(lambda: self._read_angle_raw(self._i2c_1))
+        raw2 = read_raw_averaged(lambda: self._read_angle_raw(self._i2c_2))
+        calibration = save_calibration(raw1, raw2)
+        self._offset_1_deg = calibration["sensor_1_offset_deg"]
+        self._offset_2_deg = calibration["sensor_2_offset_deg"]
+        logger.info("Angle: calibrated, offsets: %.1f, %.1f",
+                    self._offset_1_deg, self._offset_2_deg)
+        return calibration
 
     @staticmethod
     def _normalize_angle(angle_deg: float) -> float:
@@ -102,13 +169,30 @@ class AngleCapture:
 
         self._i2c_1 = ExtendedI2C(self.i2c_bus_1)
         self._i2c_2 = ExtendedI2C(self.i2c_bus_2)
+        # Opening /dev/i2c-N says nothing about the sensor behind it: read each
+        # one once, so an unplugged sensor fails here and not silently later.
+        for name, bus, i2c in (("distal", self.i2c_bus_1, self._i2c_1),
+                               ("proximal", self.i2c_bus_2, self._i2c_2)):
+            try:
+                self._read_angle_raw(i2c)
+            except OSError as e:
+                self._close()
+                raise OSError(e.errno, f"{name} sensor does not answer on "
+                                       f"/dev/i2c-{bus} ({e.strerror or e})") from e
         logger.info("Angle sensors initialized at %d Hz", self.sample_rate_hz)
 
     def _read_angle_raw(self, i2c) -> float:
         result = bytearray(2)
         i2c.writeto_then_readfrom(self.AS5600_ADDRESS, bytes([self.ANGLE_REGISTER]), result)
+        self._last_ok[0 if i2c is self._i2c_1 else 1] = time.monotonic()
         raw = ((result[0] & 0x0F) << 8) | result[1]
         return raw * 360.0 / 4096.0
+
+    def unresponsive(self) -> list[str]:
+        """The sensors that have not answered for STALE_S ("" = none)."""
+        now = time.monotonic()
+        return [name for name, t in zip(("distal", "proximal"), self._last_ok)
+                if now - t > self.STALE_S]
 
     def _capture_loop(self) -> None:
         error_count = 0
@@ -160,14 +244,16 @@ class AngleCapture:
             self._thread.join(timeout=1.0)
             self._thread = None
 
+        self._close()
+        return self._samples
+
+    def _close(self) -> None:
         if self._i2c_1 is not None:
             self._i2c_1.deinit()
             self._i2c_1 = None
         if self._i2c_2 is not None:
             self._i2c_2.deinit()
             self._i2c_2 = None
-
-        return self._samples
 
     @property
     def sample_count(self) -> int:
